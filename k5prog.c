@@ -292,10 +292,10 @@ uint16_t crc16xmodem(unsigned char *addr, int num, int crc)
 
 
 /* (de)obfuscate the string using xor */
-void xorarr(unsigned char *inarr,int len)
+void xorarr(unsigned char *inarr, int len)
 {
-	int len2=0;
-	unsigned char k5_xor_array[16]= { 
+	int len2 = 0;
+	unsigned char k5_xor_array[16] = { 
 		0x16 , 0x6c , 0x14 , 0xe6 , 0x2e , 0x91 , 0x0d , 0x40 ,
 		0x21 , 0x35 , 0xd5 , 0x40 , 0x13 , 0x03 , 0xe9 , 0x80
 	};
@@ -1000,8 +1000,12 @@ int k5_prepare(int fd)
 				"Please have the radio in normal mode to read the EEPROM\n\n");
 		return(0);
 	}
-	printf ("cmd: %2.2x %2.2x ok:%i\n", cmd->cmd[0], cmd->cmd[1], cmd->crcok);
-	printf("******  Connected to firmware version: [%s]\n", (cmd->cmd) + 4);
+
+	if (verbose)
+		printf ("cmd: %2.2x %2.2x ok:%i\n", cmd->cmd[0], cmd->cmd[1], cmd->crcok);
+
+	printf("Connected to radio with firmware version: '%s'\n", (cmd->cmd) + 4);
+
 	destroy_k5_struct(cmd);
 
 	return(1);
@@ -1017,7 +1021,8 @@ int main(int argc, char **argv)
 	int flash_max_block_addr;
 	int i, r, j, len;
 
-	printf (VERSION "\n\n"); 
+	if (verbose)
+		printf (VERSION "\n\n"); 
 
 	parse_cmdline(argc, argv);
 
@@ -1118,7 +1123,7 @@ int main(int argc, char **argv)
 
 
 	for (i = 0; i < UVK5_PREPARE_TRIES; i++) {
-		if (verbose>0) {
+		if (verbose) {
 			printf("k5_prepare: try %i\n",i);
 		}
 		r = k5_prepare(fd);
