@@ -59,6 +59,7 @@
 #define MODE_WRITE_ALL 4
 #define MODE_FLASH_DEBUG 5
 #define MODE_FLASH 6
+#define MODE_VERSION 7
 
 
 #define UVK5_EEPROM_SIZE 0x2000
@@ -810,6 +811,7 @@ void helpme()
 		"-b <file>\tfilename that contains the raw flash image (default " DEFAULT_FLASH_NAME ")\n"
 		"-Y \tincrease \"I know what I'm doing\" value, to enable functionality likely to break the radio\n"
 		"-D \twait for the message from the radio flasher, print it's version\n"
+		"-V \tread firmware version from radio and exit, good for testing serial connection with radio\n"
 		"-F \tflash firmware, WARNING: this will likely brick your radio!\n"
 		"-M <ver> \tSet the firmware major version to <ver> during the flash process (default: " DEFAULT_FLASH_VERSION ")\n"
 		"-r \tread eeprom\n"
@@ -885,9 +887,10 @@ void parse_cmdline(int argc, char **argv)
 	 * -D (flashdebug)
 	 * -F (flash)
 	 * -Y (i know what i'm doing)
+	 * -V (exit after hello/version command)
 	 */
 
-	while ((opt = getopt(argc, argv, "f:rwWBp:s:hvDFYb:M:")) != EOF) {
+	while ((opt = getopt(argc, argv, "f:rwWBp:s:hvDFVYb:M:")) != EOF) {
 		switch (opt) {
 			case 'h':
 				helpme();
@@ -895,6 +898,9 @@ void parse_cmdline(int argc, char **argv)
 				break;
 			case 'v':
 				verbose++;
+				break;
+			case 'V':
+				mode = MODE_VERSION;
 				break;
 			case 'Y':
 				i_know_what_im_doing++;
@@ -973,15 +979,17 @@ int write_file(char *name, unsigned char *buffer, int len)
 	close(fd);
 	return(1);
 }
-int k5_prepare(int fd) {
+
+int k5_prepare(int fd)
+{
 	int r;
 	struct k5_command *cmd;
 
-	r = k5_send_buf(fd,uvk5_hello,sizeof(uvk5_hello));
+	r = k5_send_buf(fd, uvk5_hello, sizeof(uvk5_hello));
 	if (!r)
 		return(0);
 
-	cmd = k5_receive(fd,10000);
+	cmd = k5_receive(fd, 10000);
 	if (!cmd)
 		return(0);
 
@@ -993,7 +1001,7 @@ int k5_prepare(int fd) {
 		return(0);
 	}
 	printf ("cmd: %2.2x %2.2x ok:%i\n", cmd->cmd[0], cmd->cmd[1], cmd->crcok);
-	printf("******  Connected to firmware version: [%s]\n", (cmd->cmd)+4);
+	printf("******  Connected to firmware version: [%s]\n", (cmd->cmd) + 4);
 	destroy_k5_struct(cmd);
 
 	return(1);
@@ -1211,6 +1219,11 @@ int main(int argc, char **argv)
 			if (verbose>0) {
 				printf("\rSuccessfully wrote EEPROM\n");
 			}
+			break;
+
+		case MODE_VERSION:
+			/* just print the detected firmware version and exit */
+			/* good for testing communication */
 			break;
 
 		default:
