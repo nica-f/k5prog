@@ -48,6 +48,7 @@
 #include <getopt.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include "uvk5.h"
 
 #define VERSION "Quansheng UV-K5 EEPROM programmer v0.9 (c) 2023 Jacek Lipkowski <sq5bpf@lipkowski.org>"
@@ -60,6 +61,7 @@
 #define MODE_FLASH_DEBUG 5
 #define MODE_FLASH 6
 #define MODE_VERSION 7
+#define MODE_DEXOR 8
 
 
 #define UVK5_EEPROM_SIZE 0x2000
@@ -91,7 +93,7 @@ int mode = MODE_NONE;
 char *file = DEFAULT_FILE_NAME;
 char *flash_file = DEFAULT_FLASH_NAME;
 
-char flash_version_string[8] = DEFAULT_FLASH_VERSION;
+char flash_version_string[16] = DEFAULT_FLASH_VERSION;
 
 int write_offset = 0;
 int write_length = -1;
@@ -602,7 +604,7 @@ int k5_reset(int fd)
 /******************************/
 
 /* wait for a "i'm in flashing mode" message */
-int wait_flash_message(int fd,int ntimes) {
+int wait_flash_message(int fd, int ntimes) {
 	struct k5_command *cmd;
 	int ok=0;
 	char buf[17];
@@ -690,20 +692,20 @@ int wait_flash_message(int fd,int ntimes) {
  * if we send a * as the first character, then all known bootloaders
  * will accept it
  */
-int k5_send_flash_version_message(int fd,char *version_string) {
-
+int k5_send_flash_version_message(int fd,char *version_string)
+{
 	int r;
 	struct k5_command *cmd;
 	//unsigned char uvk5_flash_version[]={ 0x30, 0x5, 0x10, 0x0, '2', '.', '0', '1', '.', '2', '3', 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
 	unsigned char uvk5_flash_version[] = {0x30, 0x5, 0x10, 0x0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
 
-	strncpy((char *)&uvk5_flash_version+4, flash_version_string, 8);
+	strncpy((char *)&uvk5_flash_version+4, flash_version_string, 16);
 	r = k5_send_buf(fd, uvk5_flash_version, sizeof(uvk5_flash_version));
 	if (!r)
 		return(0);
 
 	/* check if we're still getting packets, usually this is a 0x18 type packet, but not sure what else the radio can send  */
-	cmd = k5_receive(fd,10000);
+	cmd = k5_receive(fd, 10000);
 	if (!cmd)
 		return(0);
 
@@ -715,7 +717,7 @@ int k5_send_flash_version_message(int fd,char *version_string) {
 	return(1);
 }
 
-int k5_writeflash(int fd, unsigned char *buf, int  len, int offset,int max_flash_addr)
+int k5_writeflash(int fd, unsigned char *buf, int  len, int offset, int max_flash_addr)
 {
 	int l;
 	unsigned char writeflash[512];
@@ -732,10 +734,10 @@ int k5_writeflash(int fd, unsigned char *buf, int  len, int offset,int max_flash
 	 * address_msb  address_lsb  0xe6  0x0  length_msb  length_lsb  0x0  0x0 
 	 * [0x100 bytes of data, if length is <0x100 then fill the rest with zeroes] */
 	writeflash[0] = 0x19;
-	writeflash[1] = 0x5;
+	writeflash[1] = 0x05;
 	/* bytes 2,3: length is 0x10c */
-	writeflash[2] = 0xc;
-	writeflash[3] = 1; 
+	writeflash[2] = 0x0c;
+	writeflash[3] = 0x01;
 	writeflash[4] = 0x8a;
 	writeflash[5] = 0x8d;
 	writeflash[6] = 0x9f;
@@ -890,7 +892,7 @@ void parse_cmdline(int argc, char **argv)
 	 * -V (exit after hello/version command)
 	 */
 
-	while ((opt = getopt(argc, argv, "f:rwWBp:s:hvDFVYb:M:")) != EOF) {
+	while ((opt = getopt(argc, argv, "f:rwWBp:s:hvDFVXYb:M:")) != EOF) {
 		switch (opt) {
 			case 'h':
 				helpme();
@@ -942,6 +944,9 @@ void parse_cmdline(int argc, char **argv)
 					exit(1);
 					break;
 				}
+			case 'X':
+				mode = MODE_DEXOR;
+				break;
 			default:
 				fprintf(stderr,"Unknown command line option %s\n",optarg);
 				exit(1);
@@ -1011,6 +1016,71 @@ int k5_prepare(int fd)
 	return(1);
 }
 
+unsigned char *de_xor_file(void)
+{
+	int i, ffd, len2;
+	unsigned char *flash;
+	int flash_length;
+	const unsigned char key[] = {
+	        0x47, 0x22, 0xC0, 0x52, 0x5D, 0x57, 0x48, 0x94, 0xB1, 0x60, 0x60, 0xDB, 0x6F, 0xE3, 0x4C, 0x7C,
+	        0xD8, 0x4A, 0xD6, 0x8B, 0x30, 0xEC, 0x25, 0xE0, 0x4C, 0xD9, 0x00, 0x7F, 0xBF, 0xE3, 0x54, 0x05,
+	        0xE9, 0x3A, 0x97, 0x6B, 0xB0, 0x6E, 0x0C, 0xFB, 0xB1, 0x1A, 0xE2, 0xC9, 0xC1, 0x56, 0x47, 0xE9,
+	        0xBA, 0xF1, 0x42, 0xB6, 0x67, 0x5F, 0x0F, 0x96, 0xF7, 0xC9, 0x3C, 0x84, 0x1B, 0x26, 0xE1, 0x4E,
+	        0x3B, 0x6F, 0x66, 0xE6, 0xA0, 0x6A, 0xB0, 0xBF, 0xC6, 0xA5, 0x70, 0x3A, 0xBA, 0x18, 0x9E, 0x27,
+	        0x1A, 0x53, 0x5B, 0x71, 0xB1, 0x94, 0x1E, 0x18, 0xF2, 0xD6, 0x81, 0x02, 0x22, 0xFD, 0x5A, 0x28,
+	        0x91, 0xDB, 0xBA, 0x5D, 0x64, 0xC6, 0xFE, 0x86, 0x83, 0x9C, 0x50, 0x1C, 0x73, 0x03, 0x11, 0xD6,
+	        0xAF, 0x30, 0xF4, 0x2C, 0x77, 0xB2, 0x7D, 0xBB, 0x3F, 0x29, 0x28, 0x57, 0x22, 0xD6, 0x92, 0x8B,
+	};
+	unsigned char *xflash;
+	bool isstr = true;
+	bool isterm = false;
+
+	/* read the given firmware image from file */
+	flash = (unsigned char *)malloc(UVK5_MAX_FLASH_SIZE);
+	ffd = open(flash_file, O_RDONLY);
+	if (ffd < 0) {
+		fprintf(stderr, "open %s error %d %s\n", flash_file, errno, strerror(errno));
+		free(flash);
+		return NULL;
+	}
+	flash_length = read(ffd, flash, UVK5_MAX_FLASH_SIZE);
+	close(ffd);
+
+	/* de-obfuscate the firmware image */
+	xflash = flash;
+	len2=0;
+	while (len2 < flash_length) {
+		*xflash = *xflash ^ key[len2 % sizeof(key)];
+		len2++;
+		xflash++;
+	}
+	
+	/* in the obfuscated firmware images the firmware version
+	   is located @ 0x2000, a NULL terminated string
+	   of max. 15 characters */
+	for (i=0; i<16; i++) {
+		if (!isprint(*(flash+0x2000+i))) {
+			if (*(flash+0x2000+i) == 0x00)
+				isterm=true;
+			else
+				isstr=false;
+		}
+	}
+
+	/* if there is such a string we very likely have an obfuscated
+	   image at hand, if not then it is very likely a raw binary */
+	if (isstr && isterm) {
+		//printf ("at 0x2000: '%s'\n", flash+0x2000);
+		memset(flash_version_string, 0, 16);
+		strncpy(flash_version_string, (char *)flash+0x2000, 15);
+		return flash;
+	} else {
+		//printf ("no version found, likely not packed / encoded\n");
+		free(flash);
+		return NULL;
+	}
+}
+
 int main(int argc, char **argv)
 {
 	int fd, ffd;
@@ -1026,14 +1096,22 @@ int main(int argc, char **argv)
 
 	parse_cmdline(argc, argv);
 
-	if (mode==MODE_NONE) {
+	if (mode == MODE_NONE) {
 		fprintf(stderr,"No operating mode selected, use -w or -r\n");
 		helpme();
 		exit(1);
 	}
 
-	fd=openport(ser_port, ser_speed);
+	if (mode == MODE_DEXOR) {
+		if (de_xor_file() != NULL)
+			printf("packed firmware image detected: '%s'\n", flash_version_string);
+		else
+			printf("raw firmware image\n");
+		/* only query, don't do anything */
+		exit(0);
+	}
 
+	fd = openport(ser_port, ser_speed);
 	if (fd < 0) {
 		fprintf(stderr,"Open %s failed\n", ser_port);
 		exit(1);
@@ -1060,7 +1138,7 @@ int main(int argc, char **argv)
 				exit(0);
 			}
 
-			ffd = open(flash_file,O_RDONLY);
+			ffd = open(flash_file, O_RDONLY);
 			if (ffd < 0) {
 				fprintf(stderr, "open %s error %d %s\n", flash_file, errno, strerror(errno));
 				exit(1);
@@ -1076,7 +1154,7 @@ int main(int argc, char **argv)
 				}
 				exit(1);
 			}
-			if (verbose > 0) {
+			if (verbose) {
 				printf ("Read file %s success\n", flash_file);
 			}
 			flash_max_addr = flash_length;
@@ -1106,10 +1184,10 @@ int main(int argc, char **argv)
 
 			for (i = write_offset; i < flash_max_addr; i += UVK5_FLASH_BLOCKSIZE) {
 				len = flash_max_addr - i;
-				if (len>UVK5_FLASH_BLOCKSIZE)
+				if (len > UVK5_FLASH_BLOCKSIZE)
 					len = UVK5_FLASH_BLOCKSIZE;
 
-				r = k5_writeflash(fd, (unsigned char *)&flash+i, len, i, flash_max_block_addr);
+				r = k5_writeflash(fd, flash+i, len, i, flash_max_block_addr);
 
 				printf("*** FLASH at 0x%4.4x length 0x%4.4x  result=%i\n", i, len, r);
 				if (!r) {
@@ -1141,20 +1219,20 @@ int main(int argc, char **argv)
 		case MODE_READ:
 			for(i = 0; i < UVK5_EEPROM_SIZE; i = i + UVK5_EEPROM_BLOCKSIZE) {
 				if (!k5_readmem(fd, (unsigned char *)&eeprom[i], UVK5_EEPROM_BLOCKSIZE, i)) {
-					fprintf(stderr,"Failed to read block 0x%4.4X\n", i);
+					fprintf(stderr, "Failed to read block 0x%4.4X\n", i);
 					exit(1);
 				}
 				if (verbose > 0) { 
-					printf("\rread block 0x%4.4X  %i%%", i, (100*i/UVK5_EEPROM_SIZE)); 
+					printf("\rread block 0x%4.4X  %i%%", i, (100 * i / UVK5_EEPROM_SIZE)); 
 					fflush(stdout); 
 				}
 			}
 			close(fd);
-			if (verbose>0) {
+			if (verbose > 0) {
 				printf("\rSuccessfully read EEPROM\n");
 			}
-			if (verbose>2) {
-				hdump((unsigned char *)&eeprom,UVK5_EEPROM_SIZE);
+			if (verbose > 2) {
+				hdump((unsigned char *)&eeprom, UVK5_EEPROM_SIZE);
 			}
 
 			write_file(file, (unsigned char *)&eeprom, UVK5_EEPROM_SIZE);
@@ -1170,7 +1248,7 @@ int main(int argc, char **argv)
 			}
 
 			/* read file */
-			ffd = open(file,O_RDONLY);
+			ffd = open(file, O_RDONLY);
 			if (ffd < 0) {
 				fprintf(stderr,"open %s error %d %s\n", file, errno, strerror(errno));
 				exit(1);
@@ -1181,28 +1259,28 @@ int main(int argc, char **argv)
 				exit(1);
 			}
 			close(ffd);
-			if (verbose>0) {
-				printf ("Read file %s success\n",file);
+			if (verbose) {
+				printf ("Read file %s success\n", file);
 			}
 			if ((mode == MODE_WRITE_ALL) || (mode == MODE_WRITE_MOST)) {
 				j = UVK5_EEPROM_SIZE_WITHOUT_CALIBRATION;
 				if (mode == MODE_WRITE_ALL)
-					j=UVK5_EEPROM_SIZE;
+					j = UVK5_EEPROM_SIZE;
 
 				/* write to radio */
-				for (i=0; i<j; i=i+UVK5_EEPROM_BLOCKSIZE) {
+				for (i = 0; i < j; i = i + UVK5_EEPROM_BLOCKSIZE) {
 					if (!k5_writemem(fd, (unsigned char *)&eeprom[i], UVK5_EEPROM_BLOCKSIZE, i)) {
 						fprintf(stderr,"Failed to write block 0x%4.4X\n", i);
 						exit(1);
 					}
-					if (verbose > 0) { 
-						printf("\rwrite block 0x%4.4X  %i%%", i, (100*i/j)); 
+					if (verbose) { 
+						printf("\rwrite block 0x%4.4X  %i%%", i, (100 * i / j)); 
 						fflush(stdout); 
 					}
 				} 
 			} else {
 				/* write to radio */
-				i=0;
+				i = 0;
 				while (uvk5_writes[i][1]) {
 					i++;
 				}
@@ -1213,7 +1291,7 @@ int main(int argc, char **argv)
 						fprintf(stderr, "Failed to write block 0x%4.4X length 0x%2.2x\n", uvk5_writes[i][0], uvk5_writes[i][1]);
 						exit(1);
 					}
-					if (verbose>0) { 
+					if (verbose) { 
 						printf("\rwrite block 0x%4.4X  %i%%", i, (100*i/j)); 
 						fflush(stdout); 
 					}
@@ -1221,7 +1299,7 @@ int main(int argc, char **argv)
 				}
 			}
 			k5_reset(fd);
-			if (verbose>0) {
+			if (verbose) {
 				printf("\rSuccessfully wrote EEPROM\n");
 			}
 			break;
