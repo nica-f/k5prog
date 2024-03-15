@@ -92,7 +92,7 @@ int verbose = 0;
 int mode = MODE_NONE;
 char *file = DEFAULT_FILE_NAME;
 char *flash_file = DEFAULT_FLASH_NAME;
-
+int flash_length=0;
 char flash_version_string[16] = DEFAULT_FLASH_VERSION;
 
 int write_offset = 0;
@@ -186,7 +186,7 @@ int openport(char *port,speed_t speed)
 	fd = open(port, O_RDWR | O_NOCTTY);
 
 	if (fd < 0) {
-		printf("open error %d %s\n", errno, strerror(errno));
+		printf("opening '%s' error %d: %s\n", port, errno, strerror(errno));
 		return(-1);
 	}
 
@@ -625,7 +625,8 @@ int wait_flash_message(int fd, int ntimes) {
 			continue;
 		}
 
-		k5_hexdump(cmd);
+		if (verbose > 1)
+			k5_hexdump(cmd);
 
 		if (!cmd->cmd) {
 			printf("wait_flash_message: received malformed packet\n");
@@ -709,7 +710,7 @@ int k5_send_flash_version_message(int fd,char *version_string)
 	if (!cmd)
 		return(0);
 
-	if (verbose>1)
+	if (verbose > 1)
 		k5_hexdump(cmd);
 
 	destroy_k5_struct(cmd);
@@ -1016,11 +1017,20 @@ int k5_prepare(int fd)
 	return(1);
 }
 
-unsigned char *de_xor_file(void)
+bool check_image_magic(const unsigned char *flash)
 {
-	int i, ffd, len2;
-	unsigned char *flash;
-	int flash_length;
+	if (flash[ 2] == 0x00 && flash[ 3] == 0x20 && flash[ 6] == 0x00 && flash[10] == 0x00 && flash[14] == 0x00)
+		return true;
+	else
+		return false;
+}
+
+/* takes a flash image buffer and checks if the image is packed/encrypted or raw,
+   returns -1 on error, 0 for raw and 1 for packed/encrypted */
+int de_xor_file(unsigned char *flash)
+{
+	int i, len2;
+	uint16_t crc1, crc2;
 	const unsigned char key[] = {
 	        0x47, 0x22, 0xC0, 0x52, 0x5D, 0x57, 0x48, 0x94, 0xB1, 0x60, 0x60, 0xDB, 0x6F, 0xE3, 0x4C, 0x7C,
 	        0xD8, 0x4A, 0xD6, 0x8B, 0x30, 0xEC, 0x25, 0xE0, 0x4C, 0xD9, 0x00, 0x7F, 0xBF, 0xE3, 0x54, 0x05,
@@ -1034,59 +1044,86 @@ unsigned char *de_xor_file(void)
 	unsigned char *xflash;
 	bool isstr = true;
 	bool isterm = false;
+	bool crcmatch = false;
+	bool iisraw = false;
+	bool oisraw = false;
 
-	/* read the given firmware image from file */
-	flash = (unsigned char *)malloc(UVK5_MAX_FLASH_SIZE);
-	ffd = open(flash_file, O_RDONLY);
-	if (ffd < 0) {
-		fprintf(stderr, "open %s error %d %s\n", flash_file, errno, strerror(errno));
-		free(flash);
-		return NULL;
+	if (flash == NULL) {
+		fprintf(stderr, "buffer too small!");
+		return -1;
 	}
-	flash_length = read(ffd, flash, UVK5_MAX_FLASH_SIZE);
-	close(ffd);
 
-	/* de-obfuscate the firmware image */
-	xflash = flash;
-	len2=0;
-	while (len2 < flash_length) {
-		*xflash = *xflash ^ key[len2 % sizeof(key)];
-		len2++;
-		xflash++;
-	}
+	iisraw = check_image_magic(flash);
+	//printf("i: magic %s match\n", iisraw ? "does" : "does not");
+
+	crc1 = (uint16_t)(flash[flash_length-1] << 8 | flash[flash_length-2]);
+	crc2 = crc16xmodem(flash, flash_length-2, 0);
+	if (crc1 == crc2) {
+		//printf ("CRCs match\n");
+		crcmatch = true;
+		/* CRC will is omitted while flashing */
+		flash_length -= 2;
+	} else
+		printf ("CRCs don't match\n");
+
+	if (crcmatch && !iisraw && flash_length>(0x200f)) {
+		/* de-obfuscate the firmware image */
+		xflash = flash;
+		len2=0;
+		while (len2 < flash_length) {
+			*xflash = *xflash ^ key[len2 % sizeof(key)];
+			len2++;
+			xflash++;
+		}
 	
-	/* in the obfuscated firmware images the firmware version
-	   is located @ 0x2000, a NULL terminated string
-	   of max. 15 characters */
-	for (i=0; i<16; i++) {
-		if (!isprint(*(flash+0x2000+i))) {
-			if (*(flash+0x2000+i) == 0x00)
-				isterm=true;
-			else
-				isstr=false;
+		/* in the obfuscated firmware images the firmware version
+		   is located @ 0x2000, a NULL terminated string
+		   of max. 15 characters */
+		for (i=0; i<16; i++) {
+			if (!isprint(*(flash+0x2000+i))) {
+				if (*(flash+0x2000+i) == 0x00)
+					isterm = true;
+				else
+					isstr = false;
+			}
+		}
+
+		/* there is a version string of 16 bytes in total,
+		   remove it to get a raw image */
+		if (isstr && isterm) {
+			/* copy version string */
+			memset(flash_version_string, 0, 16);
+			strncpy(flash_version_string, (char *)flash+0x2000, 15);
+			/* stitch version string hole */
+			memmove((unsigned char *)(flash+0x2000), (unsigned char *)(flash+0x2000+16), flash_length-0x2000-16);
+			flash_length -= 16;
 		}
 	}
+	oisraw = check_image_magic((unsigned char *)flash);
+	//printf("o: magic %s match\n", oisraw ? "does" : "does not");
+	if (!oisraw) {
+		fprintf(stderr, "firmware image lacks magic\n");
+		return -1;
+	}
 
-	/* if there is such a string we very likely have an obfuscated
-	   image at hand, if not then it is very likely a raw binary */
-	if (isstr && isterm) {
+	/* if there is such a string and we have matching CRC16
+	   we very likely have an obfuscated image at hand,
+	   if not then it is very likely a raw binary */
+	if (crcmatch && isstr && isterm) {
 		//printf ("at 0x2000: '%s'\n", flash+0x2000);
-		memset(flash_version_string, 0, 16);
-		strncpy(flash_version_string, (char *)flash+0x2000, 15);
-		return flash;
+		return 1;
 	} else {
 		//printf ("no version found, likely not packed / encoded\n");
-		free(flash);
-		return NULL;
+		return 0;
 	}
 }
 
 int main(int argc, char **argv)
 {
-	int fd, ffd;
+	int fd=-1;
+	int ffd=-1;
 	unsigned char eeprom[UVK5_EEPROM_SIZE];
 	unsigned char flash[UVK5_MAX_FLASH_SIZE];
-	int flash_length;
 	int flash_max_addr;
 	int flash_max_block_addr;
 	int i, r, j, len;
@@ -1102,19 +1139,11 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	if (mode == MODE_DEXOR) {
-		if (de_xor_file() != NULL)
-			printf("packed firmware image detected: '%s'\n", flash_version_string);
-		else
-			printf("raw firmware image\n");
-		/* only query, don't do anything */
-		exit(0);
-	}
-
-	fd = openport(ser_port, ser_speed);
-	if (fd < 0) {
-		fprintf(stderr,"Open %s failed\n", ser_port);
-		exit(1);
+	if (mode != MODE_DEXOR) {
+		fd = openport(ser_port, ser_speed);
+		if (fd < 0) {
+			exit(1);
+		}
 	}
 
 	if (i_know_what_im_doing) {
@@ -1132,30 +1161,46 @@ int main(int argc, char **argv)
 			exit(0);
 			break;
 
-		case MODE_FLASH:
-			if (i_know_what_im_doing < 3) {
-				fprintf(stderr,"ERROR: the \"I know what i'm doing\" value has to be at least 3, to confirm that you really know what you're doing\n");
-				exit(0);
-			}
 
+		case MODE_FLASH:
+		case MODE_DEXOR:
 			ffd = open(flash_file, O_RDONLY);
 			if (ffd < 0) {
 				fprintf(stderr, "open %s error %d %s\n", flash_file, errno, strerror(errno));
 				exit(1);
 			}
-			flash_length = read(ffd, (unsigned char *)&flash, UVK5_MAX_FLASH_SIZE);
+			flash_length = read(ffd, flash, UVK5_MAX_FLASH_SIZE);
 			close(ffd);
+			if (verbose) {
+				printf ("Read file %s success, len %d bytes\n", flash_file, flash_length);
+			}
+			r = de_xor_file(flash);
+			if (r == 1)
+				printf("packed firmware image detected: '%s'\n", flash_version_string);
+			else if (r == 0)
+				printf("raw firmware image\n");
+			else {
+				fprintf(stderr, "firmware image wrong format\n");
+				exit(1);
+			}
+			if (mode == MODE_DEXOR) {
+				/* only query, don't do anything */
+				exit(0);
+			}
+			/* fall through in case of MODE_FLASH */
+			fflush(stdout);
+			if (i_know_what_im_doing < 3) {
+				fprintf(stderr,"ERROR: the \"I know what i'm doing\" value has to be at least 3, to confirm that you really know what you're doing\n");
+				exit(0);
+			}
 
 			/* arbitrary limit so that someone doesn't flash some random short file */
 			if ((i_know_what_im_doing < 5) && (flash_length < 50000)) {
-				fprintf(stderr, "Failed to read whole EEPROM from file %s (read %i), file too short or some other error\n", file, flash_length);
+				fprintf(stderr, "Failed to read whole firmware image from file %s (read %i), file too short or some other error\n", file, flash_length);
 				if (flash_length > 0) {
 					fprintf(stderr, "This failsafe is here so that people don't mistake config files with flash.\nIt can be ignored with an 'i know what i'm doing' value of at least 5\n");
 				}
 				exit(1);
-			}
-			if (verbose) {
-				printf ("Read file %s success\n", flash_file);
 			}
 			flash_max_addr = flash_length;
 
@@ -1169,12 +1214,12 @@ int main(int argc, char **argv)
 				flash_max_block_addr = (flash_max_addr & 0xff00);
 			}
 
-			printf("Writing blocks from address 0x%x until 0x%x, firmware size is 0x%x\n", write_offset, flash_max_block_addr, flash_length);
-
 			if (flash_max_block_addr > UVK5_MAX_FLASH_SIZE)  {
 				fprintf(stderr, "flash length 0x%x is greater than max flash size 0x%x\n", flash_max_block_addr, UVK5_MAX_FLASH_SIZE);
 				exit(1);
 			}
+
+			printf("Writing blocks from address 0x%x to 0x%x, firmware size is 0x%x\n", write_offset, flash_max_block_addr, flash_length);
 
 			r = wait_flash_message(fd, 10000);
 			if (!r)
@@ -1189,16 +1234,20 @@ int main(int argc, char **argv)
 
 				r = k5_writeflash(fd, flash+i, len, i, flash_max_block_addr);
 
-				printf("*** FLASH at 0x%4.4x length 0x%4.4x  result=%i\n", i, len, r);
+				if (verbose) {
+					printf("*** FLASH at 0x%4.4x length 0x%4.4x  result=%i\n", i, len, r);
+				} else {
+					printf("Flashing 0x%4.4x\r", i);
+					fflush(stdout);
+				}
 				if (!r) {
-					fprintf(stderr, "Stopping flash due to ERROR!!!\n");
+					fprintf(stderr, "\nStopping flash due to ERROR!!!\n");
 					break;
 				}
 			}
+			printf("\nFlash successful, radio will restart automatically...\n");
 			exit(0);
 	}
-
-
 
 	for (i = 0; i < UVK5_PREPARE_TRIES; i++) {
 		if (verbose) {
@@ -1214,8 +1263,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	switch (mode)
-	{
+	switch (mode) {
 		case MODE_READ:
 			for(i = 0; i < UVK5_EEPROM_SIZE; i = i + UVK5_EEPROM_BLOCKSIZE) {
 				if (!k5_readmem(fd, (unsigned char *)&eeprom[i], UVK5_EEPROM_BLOCKSIZE, i)) {
