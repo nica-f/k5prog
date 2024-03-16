@@ -62,6 +62,8 @@
 #define MODE_FLASH 6
 #define MODE_VERSION 7
 #define MODE_DEXOR 8
+#define MODE_ADC 9
+#define MODE_RSSI 10
 
 
 #define UVK5_EEPROM_SIZE 0x2000
@@ -115,6 +117,8 @@ unsigned char uvk5_hello2[] = { 0x14, 0x05, 0x04, 0x00, 0x9f, 0x25, 0x5a, 0x64 }
  * 0x14 - hello
  * 0x1b - read EEPROM
  * 0x1d - write EEPROM
+ * 0x27 - read RSSI
+ * 0x29 - read ADC
  * 0xdd - reset radio
  */
 
@@ -132,6 +136,8 @@ unsigned char uvk5_hello2[] = { 0x14, 0x05, 0x04, 0x00, 0x9f, 0x25, 0x5a, 0x64 }
 unsigned char uvk5_hello[] = { 0x14,  0x5,  0x4,  0x0,  0x6a,  0x39,  0x57,  0x64 };
 unsigned char uvk5_readmem1[] = { 0x1b,  0x5,  0x8,  0x0,  0x80,  0xe,  0x80,  0x0,  0x6a,  0x39,  0x57,  0x64 }; /* byte6 - length (max 0x80), byte 4 (lsb) ,5 (msb)  address */
 unsigned char uvk5_writemem1[] = { 0x1d, 0x5, 0x18, 0x0, 0x50, 0xf, 0x10, 0x0, 0x14, 0xad, 0x5c, 0x64, 0x43, 0x48, 0x30, 0x30, 0x31, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 }; /* byte3 - command length, byte6 - data to be written length, byte4 - (lsb) byte5( msb) address, byte12-end data */
+unsigned char uvk5_readrssi[] = { 0x27,  0x5,  0x0,  0x0 };
+unsigned char uvk5_readadc[] = { 0x29,  0x5,  0x0,  0x0 };
 unsigned char uvk5_reset[] = { 0xdd,  0x5,  0x0,  0x0 };
 
 /* terrible hexdump ripped from some old code, please don't look */
@@ -254,8 +260,6 @@ int read_timeout(int fd, unsigned char *buf, int maxlen, int timeout)
 
 	return(len);
 }
-
-
 
 void destroy_k5_struct(struct k5_command *cmd)
 {
@@ -815,6 +819,8 @@ void helpme()
 		"-Y \tincrease \"I know what I'm doing\" value, to enable functionality likely to break the radio\n"
 		"-D \twait for the message from the radio flasher, print it's version\n"
 		"-V \tread firmware version from radio and exit, good for testing serial connection with radio\n"
+		"-R \tread RSSI, noise and glitch from radio\n"
+		"-E \tread electrical data (voltage and current) from radio\n"
 		"-F \tflash firmware, WARNING: this will likely brick your radio!\n"
 		"-M <ver> \tSet the firmware major version to <ver> during the flash process (default: " DEFAULT_FLASH_VERSION ")\n"
 		"-r \tread eeprom\n"
@@ -893,7 +899,7 @@ void parse_cmdline(int argc, char **argv)
 	 * -V (exit after hello/version command)
 	 */
 
-	while ((opt = getopt(argc, argv, "f:rwWBp:s:hvDFVXYb:M:")) != EOF) {
+	while ((opt = getopt(argc, argv, "f:rwWBp:s:hvDEFRVXYb:M:")) != EOF) {
 		switch (opt) {
 			case 'h':
 				helpme();
@@ -904,6 +910,12 @@ void parse_cmdline(int argc, char **argv)
 				break;
 			case 'V':
 				mode = MODE_VERSION;
+				break;
+			case 'R':
+				mode = MODE_RSSI;
+				break;
+			case 'E':
+				mode = MODE_ADC;
 				break;
 			case 'Y':
 				i_know_what_im_doing++;
@@ -1010,7 +1022,69 @@ int k5_prepare(int fd)
 	if (verbose)
 		printf ("cmd: %2.2x %2.2x ok:%i\n", cmd->cmd[0], cmd->cmd[1], cmd->crcok);
 
-	printf("Connected to radio with firmware version: '%s'\n", (cmd->cmd) + 4);
+	printf("Radio firmware version: '%s'\n", (cmd->cmd) + 4);
+
+	destroy_k5_struct(cmd);
+
+	return(1);
+}
+
+int k5_readadc(int fd)
+{
+	int r;
+	struct k5_command *cmd;
+	uint16_t volt, curr;
+
+	r = k5_send_buf(fd, uvk5_readadc, sizeof(uvk5_readadc));
+	if (!r)
+		return(0);
+
+	cmd = k5_receive(fd, 10000);
+	if (!cmd)
+		return(0);
+
+	if (verbose)
+		printf ("got cmd: %d ok:%i\n", cmd->len, cmd->crcok);
+
+	if (cmd->len > 7) {
+		volt = cmd->cmd[5] << 8 | cmd->cmd[4];
+		curr = cmd->cmd[7] << 8 | cmd->cmd[6];
+		printf("radio %umV @ %umA\n", volt, curr);
+	} else
+		fprintf(stderr, "short reply from radio\n");
+
+	destroy_k5_struct(cmd);
+
+	return(1);
+}
+
+int k5_readrssi(int fd)
+{
+	int r;
+	struct k5_command *cmd;
+	uint16_t rssi_raw;
+	uint8_t noise, glitch;
+	double rssi=0.0;
+
+	r = k5_send_buf(fd, uvk5_readrssi, sizeof(uvk5_readrssi));
+	if (!r)
+		return(0);
+
+	cmd = k5_receive(fd, 10000);
+	if (!cmd)
+		return(0);
+
+	if (verbose)
+		printf ("got cmd: %d ok:%i\n", cmd->len, cmd->crcok);
+
+	if (cmd->len > 7) {
+		rssi_raw = (cmd->cmd[5] << 8 | cmd->cmd[4]) & 0x01ff;
+		rssi = ((float)rssi_raw / 2.) - 160.;
+		noise = cmd->cmd[6] & 0x7f;
+		glitch = cmd->cmd[7];
+		printf("radio rssi %.1f noise %u glitch %u\n", rssi, noise, glitch);
+	} else
+		fprintf(stderr, "short reply from radio\n");
 
 	destroy_k5_struct(cmd);
 
@@ -1187,13 +1261,13 @@ int main(int argc, char **argv)
 				/* only query, don't do anything */
 				exit(0);
 			}
-			/* fall through in case of MODE_FLASH */
 			fflush(stdout);
+#if 0
 			if (i_know_what_im_doing < 3) {
 				fprintf(stderr,"ERROR: the \"I know what i'm doing\" value has to be at least 3, to confirm that you really know what you're doing\n");
 				exit(0);
 			}
-
+#endif
 			/* arbitrary limit so that someone doesn't flash some random short file */
 			if ((i_know_what_im_doing < 5) && (flash_length < 50000)) {
 				fprintf(stderr, "Failed to read whole firmware image from file %s (read %i), file too short or some other error\n", file, flash_length);
@@ -1237,7 +1311,7 @@ int main(int argc, char **argv)
 				if (verbose) {
 					printf("*** FLASH at 0x%4.4x length 0x%4.4x  result=%i\n", i, len, r);
 				} else {
-					printf("Flashing 0x%4.4x\r", i);
+					printf("Flashing 0x%4.4x %i%%\r", i, (100 * i / flash_max_addr));
 					fflush(stdout);
 				}
 				if (!r) {
@@ -1264,17 +1338,22 @@ int main(int argc, char **argv)
 	}
 
 	switch (mode) {
+		case MODE_ADC:
+			k5_readadc(fd);
+			break;
+		case MODE_RSSI:
+			k5_readrssi(fd);
+			break;
 		case MODE_READ:
 			for(i = 0; i < UVK5_EEPROM_SIZE; i = i + UVK5_EEPROM_BLOCKSIZE) {
 				if (!k5_readmem(fd, (unsigned char *)&eeprom[i], UVK5_EEPROM_BLOCKSIZE, i)) {
 					fprintf(stderr, "Failed to read block 0x%4.4X\n", i);
 					exit(1);
 				}
-				if (verbose > 0) { 
-					printf("\rread block 0x%4.4X  %i%%", i, (100 * i / UVK5_EEPROM_SIZE)); 
-					fflush(stdout); 
-				}
+				printf("\rread block 0x%4.4X  %i%%", i, (100 * i / UVK5_EEPROM_SIZE));
+				fflush(stdout);
 			}
+			printf("\n");
 			close(fd);
 			if (verbose > 0) {
 				printf("\rSuccessfully read EEPROM\n");
