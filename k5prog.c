@@ -38,6 +38,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <string.h>
 #include <errno.h>
@@ -186,7 +187,7 @@ void hdump(unsigned char *buf, int len)
 
 int openport(char *port,speed_t speed)
 {
-	int fd;
+	int fd, len;
 	struct termios my_termios;
 
 	fd = open(port, O_RDWR | O_NOCTTY);
@@ -210,8 +211,19 @@ int openport(char *port,speed_t speed)
 	cfmakeraw(&my_termios);
 	cfsetspeed(&my_termios, speed);
 	if (tcsetattr(fd, TCSANOW, &my_termios)) {
-		printf("tcsetattr error %d %s\n", errno, strerror(errno));
+		fprintf(stderr, "tcsetattr error %d %s\n", errno, strerror(errno));
 		return(-1);
+	}
+
+	/* see if there is already data in the input buffer and
+	   flush it if there is */
+	len=0;
+	ioctl(fd, FIONREAD, &len);
+	if (len>0) {
+		unsigned char *buf;
+		buf=malloc(len);
+		read(fd, buf, len);
+		free(buf);
 	}
 
 	return(fd);
@@ -998,7 +1010,7 @@ int write_file(char *name, unsigned char *buffer, int len)
 	return(1);
 }
 
-int k5_prepare(int fd)
+int k5_prepare(int fd, int mode)
 {
 	int r;
 	struct k5_command *cmd;
@@ -1022,7 +1034,8 @@ int k5_prepare(int fd)
 	if (verbose)
 		printf ("cmd: %2.2x %2.2x ok:%i\n", cmd->cmd[0], cmd->cmd[1], cmd->crcok);
 
-	printf("Radio firmware version: '%s'\n", (cmd->cmd) + 4);
+	if (mode == MODE_VERSION)
+		printf("Radio firmware version: '%s'\n", (cmd->cmd) + 4);
 
 	destroy_k5_struct(cmd);
 
@@ -1327,7 +1340,7 @@ int main(int argc, char **argv)
 		if (verbose) {
 			printf("k5_prepare: try %i\n",i);
 		}
-		r = k5_prepare(fd);
+		r = k5_prepare(fd, mode);
 		if (r)
 			break;
 	}
